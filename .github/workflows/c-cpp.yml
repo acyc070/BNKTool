@@ -1,0 +1,87 @@
+name: Build and Upload Artifacts
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            build_linux: true
+            build_windows: true
+          - os: windows-latest
+            build_linux: false
+            build_windows: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ---------- Linux (Ubuntu) setup ----------
+      - name: Install MinGW-w64 (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 build-essential
+
+      # ---------- Windows (MSYS2) setup ----------
+      - name: Setup MSYS2 (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            make
+
+      # ---------- Build (Linux) ----------
+      - name: Build Linux binaries
+        if: matrix.build_linux
+        working-directory: ./src
+        run: make linux
+
+      # ---------- Build (Windows) ----------
+      - name: Build Windows binaries (Ubuntu cross-compile)
+        if: matrix.os == 'ubuntu-latest' && matrix.build_windows
+        working-directory: ./src
+        run: make windows
+
+      - name: Build Windows binaries (native MSYS2)
+        if: matrix.os == 'windows-latest'
+        shell: msys2 {0}
+        working-directory: ./src
+        run: make windows
+
+      # ---------- List built files (for verification) ----------
+      - name: List built files
+        working-directory: ./src
+        run: ls -la
+
+      # ---------- Upload artifacts ----------
+      - name: Upload Linux artifacts
+        if: matrix.build_linux
+        uses: actions/upload-artifact@v4
+        with:
+          name: bnktool-linux
+          path: |
+            src/BNKTool
+            src/BNK-Unpack
+            src/BNK-Pack
+
+      - name: Upload Windows artifacts
+        if: matrix.build_windows
+        uses: actions/upload-artifact@v4
+        with:
+          name: bnktool-windows
+          path: |
+            src/BNKTool.exe
+            src/BNK-Unpack.exe
+            src/BNK-Pack.exe
