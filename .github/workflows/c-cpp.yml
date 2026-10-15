@@ -11,6 +11,7 @@ jobs:
     name: Build on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -42,18 +43,19 @@ jobs:
             mingw-w64-x86_64-gcc
             make
 
-      # ---------- Build (Linux) ----------
+      # ---------- Build Linux ----------
       - name: Build Linux binaries
         if: matrix.build_linux
         working-directory: ./src
         run: make linux
 
-      # ---------- Build (Windows) ----------
+      # ---------- Build Windows (cross-compile from Ubuntu) ----------
       - name: Build Windows binaries (Ubuntu cross-compile)
         if: matrix.os == 'ubuntu-latest' && matrix.build_windows
         working-directory: ./src
         run: make windows
 
+      # ---------- Build Windows (native MSYS2) ----------
       - name: Build Windows binaries (native MSYS2)
         if: matrix.os == 'windows-latest'
         shell: msys2 {0}
@@ -61,13 +63,20 @@ jobs:
         run: make windows
 
       # ---------- List built files (for verification) ----------
-      - name: List built files
+      - name: List built files (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: ./src
+        run: ls -la
+
+      - name: List built files (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: msys2 {0}
         working-directory: ./src
         run: ls -la
 
       # ---------- Upload artifacts ----------
       - name: Upload Linux artifacts
-        if: matrix.build_linux
+        if: always() && matrix.build_linux
         uses: actions/upload-artifact@v4
         with:
           name: bnktool-linux
@@ -75,9 +84,10 @@ jobs:
             src/BNKTool
             src/BNK-Unpack
             src/BNK-Pack
+          if-no-files-found: error
 
       - name: Upload Windows artifacts
-        if: matrix.build_windows
+        if: always() && matrix.build_windows
         uses: actions/upload-artifact@v4
         with:
           name: bnktool-windows
@@ -85,3 +95,4 @@ jobs:
             src/BNKTool.exe
             src/BNK-Unpack.exe
             src/BNK-Pack.exe
+          if-no-files-found: error
