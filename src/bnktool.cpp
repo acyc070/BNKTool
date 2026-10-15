@@ -64,6 +64,7 @@ struct StidEntry {
 };
 
 struct StidSection {
+    uint32_t ui_type = 1;   // AKBKStringType; preserved from source bank
     std::vector<StidEntry> entries;
 };
 
@@ -87,7 +88,6 @@ struct BnkFile {
     std::optional<StidSection> stid;
     std::optional<HircSection> hirc;
 
-    // Anything we don't parse structurally (ENVS, FXPR, STMG, PLAT, INIT, ...)
     std::vector<RawSection> other_sections;
 };
 
@@ -151,6 +151,11 @@ static bool match_tag(const uint8_t* b, size_t off, const char* tag) {
 
 // ---------------------------------------------------------------------------
 // Section parsers
+//
+// Layouts below are taken from wwiser's wparser.py:
+//   - BKHD  : CAkBankMgr__ProcessBankHeader
+//   - HIRC  : CAkBankMgr__ProcessHircChunk
+//   - STID  : CAkBankMgr__ProcessStringMappingChunk
 // ---------------------------------------------------------------------------
 
 static BkhdSection parse_bkhd(const uint8_t* body, uint32_t size) {
@@ -164,24 +169,59 @@ static BkhdSection parse_bkhd(const uint8_t* body, uint32_t size) {
     return b;
 }
 
+// STID (version > 26) layout:
+//   u32 uiType                (AKBKStringType)
+//   u32 uiSize                (entry count)
+//   uiSize * {
+//       u32 bankID
+//       u8  stringsize
+//       u8[stringsize] FileName
+//   }
 static StidSection parse_stid(const uint8_t* body, uint32_t size) {
     StidSection s;
-    size_t off = 0;
-    while (off + 8 <= size) {
+    if (size < 8) return s;
+
+    s.ui_type = read_le<uint32_t>(body);
+    uint32_t count = read_le<uint32_t>(body + 4);
+
+    // sanity cap to guard against corrupt/unsupported banks
+    if (count > 0x100000) count = 0x100000;
+
+    size_t off = 8;
+    s.entries.reserve(count);
+    for (uint32_t i = 0; i < count && off + 5 <= size; ++i) {
         uint32_t id  = read_le<uint32_t>(body + off);
-        uint32_t len = read_le<uint32_t>(body + off + 4);
-        if (off + 8 + len > size) break;
-        std::string name(reinterpret_cast<const char*>(body + off + 8), len);
+        uint8_t  len = body[off + 4];
+        if (off + 5 + len > size) break;
+        std::string name(reinterpret_cast<const char*>(body + off + 5), len);
         s.entries.push_back({id, std::move(name)});
-        off += 8 + len;
+        off += 5 + len;
     }
     return s;
 }
 
+// HIRC layout (version > 48, which is what v135 uses):
+//   u32 NumReleasableHircItem
+//   NumReleasableHircItem * {
+//       u8  eHircType
+//       u32 dwSectionSize
+//       u8[dwSectionSize] payload
+//   }
+//
+// For versions <= 48 the type field is u32, but we only need to support
+// modern banks for this tool. The payload usually starts with the object's
+// u32 ID (all standard readers in wwiser read `sid('ulID')` first), so we
+// extract that for edit keying.
 static HircSection parse_hirc(const uint8_t* body, uint32_t size) {
     HircSection h;
-    size_t off = 0;
-    while (off + 5 <= size) {
+    if (size < 4) return h;
+
+    uint32_t count = read_le<uint32_t>(body);
+    if (count > 0x100000) count = 0x100000; // sanity cap
+
+    size_t off = 4;
+    h.objects.reserve(count);
+    for (uint32_t i = 0; i < count && off + 5 <= size; ++i) {
         uint8_t  type = body[off];
         uint32_t len  = read_le<uint32_t>(body + off + 1);
         if (off + 5 + len > size) break;
@@ -190,7 +230,6 @@ static HircSection parse_hirc(const uint8_t* body, uint32_t size) {
         obj.type = type;
         obj.size = len;
         obj.payload.assign(body + off + 5, body + off + 5 + len);
-        // HIRC object ID is the first u32 of the payload (little-endian).
         if (len >= 4) obj.id = read_le<uint32_t>(obj.payload.data());
 
         h.objects.push_back(std::move(obj));
@@ -290,6 +329,7 @@ static void write_bkhd_txt(const fs::path& p, const BkhdSection& b) {
 static void write_stid_txt(const fs::path& p, const StidSection& s) {
     std::ofstream f(p);
     if (!f) return;
+    f << "#uiType=" << s.ui_type << "\n";
     for (const auto& e : s.entries)
         f << "0x" << hex8(e.id) << "=" << e.name << "\n";
 }
@@ -297,6 +337,7 @@ static void write_stid_txt(const fs::path& p, const StidSection& s) {
 static void write_hirc_info(const fs::path& p, const HircSection& h) {
     std::ofstream f(p);
     if (!f) return;
+    f << "#count=" << h.objects.size() << "\n";
     for (const auto& o : h.objects)
         f << "type=" << (int)o.type
           << " id=0x" << hex8(o.id)
@@ -329,6 +370,12 @@ static void do_extract(const BnkFile& bnk, const fs::path& out_root) {
 
     if (bnk.hirc) {
         write_hirc_info(bank_dir / "hirc_info.txt", *bnk.hirc);
+
+        if (bnk.hirc->objects.empty()) {
+            std::cerr << "WARNING: HIRC section found in " << bnk.name
+                      << ".bnk but 0 objects were parsed (bank may use a "
+                         "HIRC layout not supported by this tool)\n";
+        }
 
         fs::path hirc_dir = bank_dir / "hirc";
         fs::create_directories(hirc_dir);
@@ -393,12 +440,24 @@ static void apply_stid_txt(const fs::path& p, StidSection& s) {
     while (std::getline(f, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty()) continue;
+
+        // "#uiType=N" header preserves the AKBKStringType
+        if (line[0] == '#') {
+            auto eq = line.find('=');
+            if (eq != std::string::npos &&
+                line.compare(0, eq, "#uiType") == 0) {
+                try { s.ui_type = (uint32_t)std::stoul(line.substr(eq + 1)); }
+                catch (...) {}
+            }
+            continue;
+        }
+
         auto eq = line.find('=');
         if (eq == std::string::npos) continue;
         std::string k = line.substr(0, eq);
         std::string v = line.substr(eq + 1);
         try {
-            uint32_t id = (uint32_t)std::stoul(k, nullptr, 0); // handles 0x prefix
+            uint32_t id = (uint32_t)std::stoul(k, nullptr, 0); // handles 0x
             new_entries.push_back({id, v});
         } catch (...) {}
     }
@@ -414,8 +473,8 @@ static void apply_hirc_replacements(const fs::path& hirc_dir, HircSection& h) {
         if (fs::exists(p)) {
             o.payload = read_file(p);
             o.size    = (uint32_t)o.payload.size();
-            // Refresh id if the payload still encodes it in the first 4 bytes.
-            if (o.payload.size() >= 4) o.id = read_le<uint32_t>(o.payload.data());
+            if (o.payload.size() >= 4)
+                o.id = read_le<uint32_t>(o.payload.data());
         }
     }
 }
@@ -436,9 +495,11 @@ static std::vector<uint8_t> serialize_bkhd(const BkhdSection& b) {
 
 static std::vector<uint8_t> serialize_stid(const StidSection& s) {
     std::vector<uint8_t> out;
+    write_le<uint32_t>(out, s.ui_type);
+    write_le<uint32_t>(out, (uint32_t)s.entries.size());
     for (const auto& e : s.entries) {
         write_le<uint32_t>(out, e.id);
-        write_le<uint32_t>(out, (uint32_t)e.name.size());
+        out.push_back((uint8_t)e.name.size());
         out.insert(out.end(), e.name.begin(), e.name.end());
     }
     return out;
@@ -446,6 +507,7 @@ static std::vector<uint8_t> serialize_stid(const StidSection& s) {
 
 static std::vector<uint8_t> serialize_hirc(const HircSection& h) {
     std::vector<uint8_t> out;
+    write_le<uint32_t>(out, (uint32_t)h.objects.size()); // <-- count header!
     for (const auto& obj : h.objects) {
         out.push_back(obj.type);
         write_le<uint32_t>(out, (uint32_t)obj.payload.size());
